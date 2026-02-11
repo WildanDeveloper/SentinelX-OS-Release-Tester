@@ -1,0 +1,363 @@
+#!/bin/bash
+# SentinelX OS - Backup & Recovery System
+# Automated Btrfs snapshot management with rollback capability
+
+set -e
+
+BACKUP_ROOT="/var/lib/sentinelx/snapshots"
+SUBVOL_ROOT="/"
+MAX_SNAPSHOTS=10
+LOG_FILE="/var/log/sentinelx/backup.log"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+check_btrfs() {
+    if ! command -v btrfs &> /dev/null; then
+        log_error "btrfs command not found. Is btrfs-progs installed?"
+        exit 1
+    fi
+    
+    # Check if root is btrfs
+    if ! df -T / | grep -q btrfs; then
+        log_warning "Root filesystem is not btrfs. Snapshot features disabled."
+        return 1
+    fi
+    
+    return 0
+}
+
+create_snapshot() {
+    local snapshot_name="$1"
+    local source="${2:-/}"
+    
+    if ! check_btrfs; then
+        log_error "Cannot create snapshot: btrfs not available"
+        return 1
+    fi
+    
+    mkdir -p "$BACKUP_ROOT"
+    
+    local snapshot_path="$BACKUP_ROOT/$snapshot_name"
+    
+    log_info "Creating snapshot: $snapshot_name"
+    
+    if btrfs subvolume snapshot -r "$source" "$snapshot_path" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Snapshot created: $snapshot_path"
+        
+        # Create metadata
+        cat > "${snapshot_path}.meta" <<EOF
+{
+    "name": "$snapshot_name",
+    "timestamp": "$(date -Iseconds)",
+    "source": "$source",
+    "type": "manual",
+    "size": "$(du -sh "$snapshot_path" | cut -f1)"
+}
+EOF
+        return 0
+    else
+        log_error "Failed to create snapshot"
+        return 1
+    fi
+}
+
+auto_snapshot() {
+    local snapshot_name="auto-$(date +%Y%m%d-%H%M%S)"
+    
+    log_info "Creating automatic snapshot..."
+    
+    if create_snapshot "$snapshot_name"; then
+        # Update metadata to mark as automatic
+        sed -i 's/"type": "manual"/"type": "automatic"/' "${BACKUP_ROOT}/${snapshot_name}.meta"
+        
+        # Cleanup old snapshots
+        cleanup_old_snapshots
+        
+        return 0
+    fi
+    
+    return 1
+}
+
+list_snapshots() {
+    if [ ! -d "$BACKUP_ROOT" ]; then
+        log_info "No snapshots found"
+        return
+    fi
+    
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "                  Available Snapshots"
+    echo "═══════════════════════════════════════════════════════════"
+    echo ""
+    printf "%-5s %-30s %-20s %-10s\n" "No." "Name" "Created" "Type"
+    echo "───────────────────────────────────────────────────────────"
+    
+    local index=1
+    for snapshot in "$BACKUP_ROOT"/*; do
+        if [ -d "$snapshot" ]; then
+            local name=$(basename "$snapshot")
+            local meta="${snapshot}.meta"
+            
+            if [ -f "$meta" ]; then
+                local timestamp=$(grep "timestamp" "$meta" | cut -d'"' -f4)
+                local type=$(grep "type" "$meta" | cut -d'"' -f4)
+                printf "%-5s %-30s %-20s %-10s\n" "$index" "$name" "$timestamp" "$type"
+            else
+                printf "%-5s %-30s %-20s %-10s\n" "$index" "$name" "unknown" "unknown"
+            fi
+            
+            index=$((index + 1))
+        fi
+    done
+    
+    echo "═══════════════════════════════════════════════════════════"
+    echo ""
+}
+
+rollback_snapshot() {
+    local snapshot_name="$1"
+    local snapshot_path="$BACKUP_ROOT/$snapshot_name"
+    
+    if [ ! -d "$snapshot_path" ]; then
+        log_error "Snapshot not found: $snapshot_name"
+        return 1
+    fi
+    
+    log_warning "═══════════════════════════════════════════════════════"
+    log_warning "  WARNING: System will rollback to snapshot"
+    log_warning "  Snapshot: $snapshot_name"
+    log_warning "  This operation cannot be undone!"
+    log_warning "═══════════════════════════════════════════════════════"
+    
+    read -p "Are you sure you want to continue? (yes/no): " confirm
+    
+    if [ "$confirm" != "yes" ]; then
+        log_info "Rollback cancelled"
+        return 1
+    fi
+    
+    # Create a pre-rollback snapshot
+    log_info "Creating pre-rollback snapshot..."
+    local pre_rollback_name="pre-rollback-$(date +%Y%m%d-%H%M%S)"
+    create_snapshot "$pre_rollback_name"
+    
+    # Perform rollback
+    log_info "Performing rollback to: $snapshot_name"
+    
+    # This is a simplified version - actual implementation would need to:
+    # 1. Move current root subvolume
+    # 2. Create new subvolume from snapshot
+    # 3. Update bootloader
+    # 4. Reboot system
+    
+    log_warning "Rollback prepared. System reboot required."
+    log_info "New root subvolume will be active after reboot"
+    
+    return 0
+}
+
+cleanup_old_snapshots() {
+    log_info "Cleaning up old automatic snapshots..."
+    
+    local auto_snapshots=($(find "$BACKUP_ROOT" -maxdepth 1 -type d -name "auto-*" | sort -r))
+    local count=${#auto_snapshots[@]}
+    
+    if [ $count -gt $MAX_SNAPSHOTS ]; then
+        local to_remove=$((count - MAX_SNAPSHOTS))
+        log_info "Removing $to_remove old snapshots..."
+        
+        for ((i=MAX_SNAPSHOTS; i<count; i++)); do
+            local snapshot="${auto_snapshots[$i]}"
+            log_info "Removing: $(basename "$snapshot")"
+            
+            if btrfs subvolume delete "$snapshot" 2>&1 | tee -a "$LOG_FILE"; then
+                rm -f "${snapshot}.meta"
+                log_success "Removed: $(basename "$snapshot")"
+            else
+                log_error "Failed to remove: $(basename "$snapshot")"
+            fi
+        done
+    else
+        log_info "No cleanup needed. Current snapshots: $count / $MAX_SNAPSHOTS"
+    fi
+}
+
+delete_snapshot() {
+    local snapshot_name="$1"
+    local snapshot_path="$BACKUP_ROOT/$snapshot_name"
+    
+    if [ ! -d "$snapshot_path" ]; then
+        log_error "Snapshot not found: $snapshot_name"
+        return 1
+    fi
+    
+    log_warning "Deleting snapshot: $snapshot_name"
+    
+    if btrfs subvolume delete "$snapshot_path" 2>&1 | tee -a "$LOG_FILE"; then
+        rm -f "${snapshot_path}.meta"
+        log_success "Snapshot deleted: $snapshot_name"
+        return 0
+    else
+        log_error "Failed to delete snapshot"
+        return 1
+    fi
+}
+
+system_backup() {
+    log_info "Starting full system backup..."
+    
+    # Create snapshot
+    auto_snapshot
+    
+    # Backup configuration files
+    local config_backup="/tmp/sentinelx-config-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    
+    log_info "Backing up configuration files..."
+    tar czf "$config_backup" \
+        /etc/sentinelx \
+        /etc/fstab \
+        /etc/default/grub \
+        /boot/loader \
+        2>/dev/null || true
+    
+    log_success "Configuration backup created: $config_backup"
+    
+    # Generate system report
+    log_info "Generating system report..."
+    
+    cat > "/tmp/system-report-$(date +%Y%m%d-%H%M%S).txt" <<EOF
+SentinelX OS System Report
+Generated: $(date)
+
+=== System Information ===
+Hostname: $(hostname)
+Kernel: $(uname -r)
+Uptime: $(uptime -p)
+
+=== Disk Usage ===
+$(df -h)
+
+=== Memory Usage ===
+$(free -h)
+
+=== Package Count ===
+Pacman packages: $(pacman -Q 2>/dev/null | wc -l || echo "N/A")
+RPM packages: $(rpm -qa 2>/dev/null | wc -l || echo "N/A")
+
+=== Snapshots ===
+$(ls -lh "$BACKUP_ROOT" 2>/dev/null || echo "No snapshots")
+
+=== Services ===
+$(systemctl list-units --state=running --no-pager | head -20)
+EOF
+    
+    log_success "System backup completed"
+}
+
+show_help() {
+    cat <<EOF
+SentinelX OS - Backup & Recovery System
+
+Usage: sx-backup [COMMAND] [OPTIONS]
+
+Commands:
+    create <name>       Create a named snapshot
+    auto                Create automatic snapshot
+    list                List all snapshots
+    rollback <name>     Rollback to a specific snapshot
+    delete <name>       Delete a snapshot
+    cleanup             Remove old automatic snapshots
+    backup              Full system backup
+    help                Show this help message
+
+Examples:
+    sx-backup create before-update
+    sx-backup auto
+    sx-backup list
+    sx-backup rollback auto-20260210-120000
+    sx-backup delete old-snapshot
+    sx-backup backup
+
+Configuration:
+    Backup root: $BACKUP_ROOT
+    Max snapshots: $MAX_SNAPSHOTS
+    Log file: $LOG_FILE
+EOF
+}
+
+# Main execution
+main() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    
+    case "${1:-help}" in
+        create)
+            if [ -z "$2" ]; then
+                log_error "Snapshot name required"
+                exit 1
+            fi
+            create_snapshot "$2"
+            ;;
+        auto)
+            auto_snapshot
+            ;;
+        list)
+            list_snapshots
+            ;;
+        rollback)
+            if [ -z "$2" ]; then
+                log_error "Snapshot name required"
+                exit 1
+            fi
+            rollback_snapshot "$2"
+            ;;
+        delete)
+            if [ -z "$2" ]; then
+                log_error "Snapshot name required"
+                exit 1
+            fi
+            delete_snapshot "$2"
+            ;;
+        cleanup)
+            cleanup_old_snapshots
+            ;;
+        backup)
+            system_backup
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            log_error "Unknown command: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

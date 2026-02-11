@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""
+SentinelX Network Optimizer
+
+Advanced network performance tuning and monitoring tool that provides:
+- Real-time network performance analysis
+- Automatic optimization based on workload
+- Latency optimization for gaming/streaming
+- Bandwidth optimization for downloads/uploads
+- Network congestion detection and mitigation
+- DNS performance tuning
+- Connection tracking optimization
+
+Copyright (C) 2026 WildanDev
+License: GPL v3
+"""
+
+import os
+import sys
+import time
+import json
+import subprocess
+import socket
+import struct
+import threading
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+from collections import deque
+from datetime import datetime
+
+# Check root privileges
+if os.geteuid() != 0:
+    print("Error: This script must be run as root (sudo)")
+    sys.exit(1)
+
+@dataclass
+class NetworkStats:
+    """Network interface statistics"""
+    interface: str
+    rx_bytes: int
+    tx_bytes: int
+    rx_packets: int
+    tx_packets: int
+    rx_errors: int
+    tx_errors: int
+    rx_dropped: int
+    tx_dropped: int
+    timestamp: float
+
+@dataclass
+class LatencyStats:
+    """Latency measurement statistics"""
+    min_ms: float
+    max_ms: float
+    avg_ms: float
+    jitter_ms: float
+    packet_loss: float
+
+class NetworkOptimizer:
+    """Advanced network performance optimizer"""
+    
+    def __init__(self):
+        self.interfaces = self._get_interfaces()
+        self.stats_history: Dict[str, deque] = {}
+        self.optimization_mode = "balanced"
+        self.monitoring = False
+        self.config_backup = "/var/lib/sx/network_backup.json"
+        
+        # Initialize history for each interface
+        for iface in self.interfaces:
+            self.stats_history[iface] = deque(maxlen=60)  # Keep last 60 samples
+    
+    def _get_interfaces(self) -> List[str]:
+        """Get list of active network interfaces"""
+        interfaces = []
+        try:
+            with open('/proc/net/dev', 'r') as f:
+                for line in f:
+                    if ':' in line:
+                        iface = line.split(':')[0].strip()
+                        if iface != 'lo':  # Skip loopback
+                            interfaces.append(iface)
+        except Exception as e:
+            print(f"Error getting interfaces: {e}")
+        return interfaces
+    
+    def get_interface_stats(self, interface: str) -> Optional[NetworkStats]:
+        """Get current statistics for an interface"""
+        try:
+            with open(f'/sys/class/net/{interface}/statistics/rx_bytes', 'r') as f:
+                rx_bytes = int(f.read().strip())
+            with open(f'/sys/class/net/{interface}/statistics/tx_bytes', 'r') as f:
+                tx_bytes = int(f.read().strip())
+            with open(f'/sys/class/net/{interface}/statistics/rx_packets', 'r') as f:
+                rx_packets = int(f.read().strip())
+            with open(f'/sys/class/net/{interface}/statistics/tx_packets', 'r') as f:
+                tx_packets = int(f.read().strip())
+            with open(f'/sys/class/net/{interface}/statistics/rx_errors', 'r') as f:
+                rx_errors = int(f.read().strip())
+            with open(f'/sys/class/net/{interface}/statistics/tx_errors', 'r') as f:
+                tx_errors = int(f.read().strip())
+            with open(f'/sys/class/net/{interface}/statistics/rx_dropped', 'r') as f:
+                rx_dropped = int(f.read().strip())
+            with open(f'/sys/class/net/{interface}/statistics/tx_dropped', 'r') as f:
+                tx_dropped = int(f.read().strip())
+            
+            return NetworkStats(
+                interface=interface,
+                rx_bytes=rx_bytes,
+                tx_bytes=tx_bytes,
+                rx_packets=rx_packets,
+                tx_packets=tx_packets,
+                rx_errors=rx_errors,
+                tx_errors=tx_errors,
+                rx_dropped=rx_dropped,
+                tx_dropped=tx_dropped,
+                timestamp=time.time()
+            )
+        except Exception as e:
+            print(f"Error getting stats for {interface}: {e}")
+            return None
+    
+    def calculate_bandwidth(self, iface: str) -> Tuple[float, float]:
+        """Calculate current RX/TX bandwidth in Mbps"""
+        history = self.stats_history.get(iface, [])
+        if len(history) < 2:
+            return 0.0, 0.0
+        
+        recent = history[-1]
+        previous = history[-2]
+        
+        time_diff = recent.timestamp - previous.timestamp
+        if time_diff == 0:
+            return 0.0, 0.0
+        
+        rx_bps = (recent.rx_bytes - previous.rx_bytes) * 8 / time_diff / 1_000_000
+        tx_bps = (recent.tx_bytes - previous.tx_bytes) * 8 / time_diff / 1_000_000
+        
+        return max(0, rx_bps), max(0, tx_bps)
+    
+    def measure_latency(self, host: str = "8.8.8.8", count: int = 10) -> Optional[LatencyStats]:
+        """Measure latency to a host using ping"""
+        try:
+            result = subprocess.run(
+                ['ping', '-c', str(count), '-q', host],
+                capture_output=True,
+                text=True,
+                timeout=count + 5
+            )
+            
+            if result.returncode != 0:
+                return None
+            
+            # Parse ping output
+            lines = result.stdout.split('\n')
+            stats_line = next((l for l in lines if 'rtt min/avg/max/mdev' in l), None)
+            packet_line = next((l for l in lines if 'packet loss' in l), None)
+            
+            if not stats_line or not packet_line:
+                return None
+            
+            # Extract statistics
+            stats = stats_line.split('=')[1].strip().split('/')
+            min_ms = float(stats[0])
+            avg_ms = float(stats[1])
+            max_ms = float(stats[2])
+            mdev_ms = float(stats[3].split()[0])
+            
+            # Extract packet loss
+            loss_str = [s for s in packet_line.split() if '%' in s][0]
+            packet_loss = float(loss_str.replace('%', ''))
+            
+            return LatencyStats(
+                min_ms=min_ms,
+                max_ms=max_ms,
+                avg_ms=avg_ms,
+                jitter_ms=mdev_ms,
+                packet_loss=packet_loss
+            )
+        except Exception as e:
+            print(f"Error measuring latency: {e}")
+            return None
+    
+    def optimize_tcp_stack(self, mode: str = "balanced"):
+        """Optimize TCP stack parameters"""
+        print(f"[OPTIMIZER] Optimizing TCP stack for mode: {mode}")
+        
+        optimizations = {
+            "lowlatency": {
+                "net.ipv4.tcp_low_latency": "1",
+                "net.ipv4.tcp_congestion_control": "bbr",
+                "net.core.default_qdisc": "fq_codel",
+                "net.ipv4.tcp_fastopen": "3",
+                "net.ipv4.tcp_no_metrics_save": "1",
+                "net.ipv4.tcp_timestamps": "1",
+                "net.ipv4.tcp_sack": "1",
+                "net.ipv4.tcp_window_scaling": "1",
+                "net.core.rmem_max": "33554432",
+                "net.core.wmem_max": "33554432",
+                "net.ipv4.tcp_rmem": "4096 131072 33554432",
+                "net.ipv4.tcp_wmem": "4096 131072 33554432",
+                "net.core.netdev_max_backlog": "5000",
+                "net.ipv4.tcp_max_syn_backlog": "4096",
+            },
+            "balanced": {
+                "net.ipv4.tcp_congestion_control": "bbr",
+                "net.core.default_qdisc": "fq",
+                "net.ipv4.tcp_fastopen": "3",
+                "net.ipv4.tcp_timestamps": "1",
+                "net.ipv4.tcp_sack": "1",
+                "net.ipv4.tcp_window_scaling": "1",
+                "net.core.rmem_max": "16777216",
+                "net.core.wmem_max": "16777216",
+                "net.ipv4.tcp_rmem": "4096 87380 16777216",
+                "net.ipv4.tcp_wmem": "4096 65536 16777216",
+                "net.core.netdev_max_backlog": "2500",
+            },
+            "throughput": {
+                "net.ipv4.tcp_congestion_control": "cubic",
+                "net.core.default_qdisc": "fq",
+                "net.ipv4.tcp_timestamps": "1",
+                "net.ipv4.tcp_sack": "1",
+                "net.ipv4.tcp_window_scaling": "1",
+                "net.core.rmem_max": "67108864",
+                "net.core.wmem_max": "67108864",
+                "net.ipv4.tcp_rmem": "4096 262144 67108864",
+                "net.ipv4.tcp_wmem": "4096 262144 67108864",
+                "net.core.netdev_max_backlog": "10000",
+                "net.ipv4.tcp_max_syn_backlog": "8192",
+                "net.core.somaxconn": "4096",
+            }
+        }
+        
+        params = optimizations.get(mode, optimizations["balanced"])
+        
+        for param, value in params.items():
+            try:
+                subprocess.run(['sysctl', '-w', f'{param}={value}'], 
+                             capture_output=True, check=True)
+                print(f"  ✓ {param} = {value}")
+            except subprocess.CalledProcessError as e:
+                print(f"  ✗ Failed to set {param}: {e}")
+    
+    def optimize_interface(self, interface: str, mode: str = "balanced"):
+        """Optimize network interface settings"""
+        print(f"[OPTIMIZER] Optimizing interface {interface} for mode: {mode}")
+        
+        # Get maximum ring buffer sizes
+        try:
+            result = subprocess.run(['ethtool', '-g', interface],
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')
+                for i, line in enumerate(lines):
+                    if 'Pre-set maximums' in line or 'Ring parameters' in line:
+                        # Find RX and TX max values
+                        for j in range(i+1, min(i+5, len(lines))):
+                            if 'RX:' in lines[j]:
+                                rx_max = int(lines[j].split()[-1])
+                            elif 'TX:' in lines[j]:
+                                tx_max = int(lines[j].split()[-1])
+                        
+                        # Set to maximum
+                        if mode in ["lowlatency", "throughput"]:
+                            subprocess.run(['ethtool', '-G', interface, 
+                                          'rx', str(rx_max), 'tx', str(tx_max)],
+                                         capture_output=True)
+                            print(f"  ✓ Ring buffers set to maximum (RX: {rx_max}, TX: {tx_max})")
+                        break
+        except Exception as e:
+            print(f"  ! Could not optimize ring buffers: {e}")
+        
+        # Disable offload features for low latency
+        if mode == "lowlatency":
+            offload_features = ['gro', 'lro', 'gso', 'tso']
+            for feature in offload_features:
+                try:
+                    subprocess.run(['ethtool', '-K', interface, feature, 'off'],
+                                 capture_output=True)
+                    print(f"  ✓ Disabled {feature} for lower latency")
+                except:
+                    pass
+        
+        # Enable interrupt coalescing for throughput
+        elif mode == "throughput":
+            try:
+                subprocess.run(['ethtool', '-C', interface, 
+                              'rx-usecs', '100', 'tx-usecs', '100'],
+                             capture_output=True)
+                print(f"  ✓ Enabled interrupt coalescing for throughput")
+            except:
+                pass
+    
+    def optimize_dns(self):
+        """Optimize DNS resolution"""
+        print("[OPTIMIZER] Optimizing DNS resolution")
+        
+        # Use fast public DNS servers
+        fast_dns = [
+            "1.1.1.1",  # Cloudflare
+            "1.0.0.1",  # Cloudflare secondary
+            "8.8.8.8",  # Google
+            "8.8.4.4",  # Google secondary
+        ]
+        
+        # Backup current resolv.conf
+        try:
+            with open('/etc/resolv.conf', 'r') as f:
+                current_dns = f.read()
+            with open('/etc/resolv.conf.backup', 'w') as f:
+                f.write(current_dns)
+        except:
+            pass
+        
+        # Write optimized DNS config
+        try:
+            with open('/etc/resolv.conf', 'w') as f:
+                for dns in fast_dns:
+                    f.write(f"nameserver {dns}\n")
+                f.write("options timeout:1 attempts:2 rotate\n")
+            print("  ✓ DNS servers optimized")
+        except Exception as e:
+            print(f"  ✗ Failed to optimize DNS: {e}")
+    
+    def optimize_conntrack(self):
+        """Optimize connection tracking"""
+        print("[OPTIMIZER] Optimizing connection tracking")
+        
+        conntrack_params = {
+            "net.netfilter.nf_conntrack_max": "262144",
+            "net.netfilter.nf_conntrack_tcp_timeout_established": "432000",
+            "net.netfilter.nf_conntrack_tcp_timeout_time_wait": "30",
+            "net.netfilter.nf_conntrack_tcp_timeout_close_wait": "15",
+            "net.netfilter.nf_conntrack_tcp_timeout_fin_wait": "30",
+        }
+        
+        for param, value in conntrack_params.items():
+            try:
+                subprocess.run(['sysctl', '-w', f'{param}={value}'],
+                             capture_output=True, check=True)
+                print(f"  ✓ {param} = {value}")
+            except:
+                pass
+    
+    def detect_workload(self) -> str:
+        """Detect current network workload and recommend mode"""
+        # Sample bandwidth for 5 seconds
+        print("[ANALYZER] Analyzing network workload...")
+        
+        samples = []
+        for _ in range(5):
+            total_rx = 0
+            total_tx = 0
+            for iface in self.interfaces:
+                stats = self.get_interface_stats(iface)
+                if stats:
+                    self.stats_history[iface].append(stats)
+                    rx, tx = self.calculate_bandwidth(iface)
+                    total_rx += rx
+                    total_tx += tx
+            samples.append((total_rx, total_tx))
+            time.sleep(1)
+        
+        avg_rx = sum(s[0] for s in samples) / len(samples)
+        avg_tx = sum(s[1] for s in samples) / len(samples)
+        
+        # Measure latency
+        latency = self.measure_latency()
+        
+        print(f"  Average RX: {avg_rx:.2f} Mbps")
+        print(f"  Average TX: {avg_tx:.2f} Mbps")
+        if latency:
+            print(f"  Latency: {latency.avg_ms:.2f} ms (jitter: {latency.jitter_ms:.2f} ms)")
+        
+        # Determine optimal mode
+        if latency and latency.avg_ms > 100:
+            mode = "lowlatency"
+            reason = "High latency detected"
+        elif avg_rx > 100 or avg_tx > 100:
+            mode = "throughput"
+            reason = "High bandwidth usage detected"
+        else:
+            mode = "balanced"
+            reason = "Normal network usage"
+        
+        print(f"  Recommendation: {mode} mode ({reason})")
+        return mode
+    
+    def monitor_network(self, duration: int = 0):
+        """Monitor network performance in real-time"""
+        print("\n" + "="*70)
+        print("  SENTINELX NETWORK MONITOR")
+        print("="*70)
+        print(f"Monitoring {len(self.interfaces)} interface(s)")
+        print("Press Ctrl+C to stop\n")
+        
+        self.monitoring = True
+        start_time = time.time()
+        
+        try:
+            iteration = 0
+            while self.monitoring:
+                if duration > 0 and (time.time() - start_time) > duration:
+                    break
+                
+                os.system('clear')
+                print("\n" + "="*70)
+                print(f"  SENTINELX NETWORK MONITOR - {datetime.now().strftime('%H:%M:%S')}")
+                print("="*70)
+                print(f"Mode: {self.optimization_mode.upper()}\n")
+                
+                for iface in self.interfaces:
+                    stats = self.get_interface_stats(iface)
+                    if stats:
+                        self.stats_history[iface].append(stats)
+                        rx_mbps, tx_mbps = self.calculate_bandwidth(iface)
+                        
+                        print(f"Interface: {iface}")
+                        print(f"  RX: {rx_mbps:8.2f} Mbps | TX: {tx_mbps:8.2f} Mbps")
+                        print(f"  Packets RX: {stats.rx_packets:12,} | TX: {stats.tx_packets:12,}")
+                        print(f"  Errors RX:  {stats.rx_errors:12,} | TX: {stats.tx_errors:12,}")
+                        print(f"  Dropped RX: {stats.rx_dropped:12,} | TX: {stats.tx_dropped:12,}")
+                        print()
+                
+                # Measure latency periodically
+                if iteration % 10 == 0:
+                    latency = self.measure_latency(count=5)
+                    if latency:
+                        print("Latency Statistics:")
+                        print(f"  Avg: {latency.avg_ms:.2f} ms | Jitter: {latency.jitter_ms:.2f} ms")
+                        print(f"  Min: {latency.min_ms:.2f} ms | Max: {latency.max_ms:.2f} ms")
+                        print(f"  Loss: {latency.packet_loss:.1f}%")
+                        print()
+                
+                print("="*70)
+                print("Press Ctrl+C to stop monitoring")
+                
+                iteration += 1
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            print("\n\nMonitoring stopped.")
+            self.monitoring = False
+    
+    def apply_optimizations(self, mode: str = None):
+        """Apply all network optimizations"""
+        if mode is None:
+            mode = self.detect_workload()
+        
+        self.optimization_mode = mode
+        
+        print("\n" + "="*70)
+        print(f"  APPLYING OPTIMIZATIONS - MODE: {mode.upper()}")
+        print("="*70 + "\n")
+        
+        # Optimize TCP stack
+        self.optimize_tcp_stack(mode)
+        print()
+        
+        # Optimize each interface
+        for iface in self.interfaces:
+            self.optimize_interface(iface, mode)
+            print()
+        
+        # Optimize DNS
+        self.optimize_dns()
+        print()
+        
+        # Optimize connection tracking
+        self.optimize_conntrack()
+        print()
+        
+        print("="*70)
+        print("  OPTIMIZATION COMPLETE")
+        print("="*70 + "\n")
+    
+    def show_status(self):
+        """Show current network status and settings"""
+        print("\n" + "="*70)
+        print("  NETWORK OPTIMIZER STATUS")
+        print("="*70 + "\n")
+        
+        print(f"Current Mode: {self.optimization_mode}")
+        print(f"Active Interfaces: {', '.join(self.interfaces)}\n")
+        
+        # Show TCP settings
+        print("TCP Settings:")
+        tcp_params = [
+            "net.ipv4.tcp_congestion_control",
+            "net.core.default_qdisc",
+            "net.core.rmem_max",
+            "net.core.wmem_max",
+        ]
+        
+        for param in tcp_params:
+            try:
+                result = subprocess.run(['sysctl', '-n', param],
+                                      capture_output=True, text=True)
+                value = result.stdout.strip()
+                print(f"  {param}: {value}")
+            except:
+                pass
+        
+        print()
+
+def show_help():
+    """Show help message"""
+    print("""
+SentinelX Network Optimizer v2.0
+
+Usage: sx-network-optimizer [COMMAND] [OPTIONS]
+
+COMMANDS:
+    optimize [mode]     Apply network optimizations
+                        Modes: lowlatency, balanced, throughput
+                        If no mode specified, auto-detects optimal mode
+    
+    monitor [seconds]   Monitor network performance in real-time
+                        Optional: specify duration in seconds
+    
+    analyze             Analyze network and recommend optimal mode
+    
+    status              Show current network status and settings
+    
+    restore             Restore original network settings
+    
+    help                Show this help message
+
+EXAMPLES:
+    # Auto-detect and optimize
+    sudo sx-network-optimizer optimize
+    
+    # Apply low-latency mode (for gaming/streaming)
+    sudo sx-network-optimizer optimize lowlatency
+    
+    # Monitor network for 60 seconds
+    sudo sx-network-optimizer monitor 60
+    
+    # Analyze network workload
+    sudo sx-network-optimizer analyze
+    
+    # Show current status
+    sx-network-optimizer status
+
+MODES:
+    lowlatency   - Minimize latency for gaming, video calls, real-time apps
+    balanced     - Balance between latency and throughput (default)
+    throughput   - Maximize bandwidth for downloads, file transfers
+
+""")
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) < 2:
+        show_help()
+        sys.exit(0)
+    
+    command = sys.argv[1].lower()
+    optimizer = NetworkOptimizer()
+    
+    if command == "optimize":
+        mode = sys.argv[2] if len(sys.argv) > 2 else None
+        if mode and mode not in ["lowlatency", "balanced", "throughput"]:
+            print(f"Error: Invalid mode '{mode}'")
+            print("Valid modes: lowlatency, balanced, throughput")
+            sys.exit(1)
+        optimizer.apply_optimizations(mode)
+    
+    elif command == "monitor":
+        duration = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+        optimizer.monitor_network(duration)
+    
+    elif command == "analyze":
+        optimizer.detect_workload()
+    
+    elif command == "status":
+        optimizer.show_status()
+    
+    elif command == "restore":
+        print("Restoring original settings...")
+        # Restore from backup if available
+        try:
+            subprocess.run(['cp', '/etc/resolv.conf.backup', '/etc/resolv.conf'],
+                         check=True)
+            print("DNS settings restored")
+        except:
+            print("No backup found or restore failed")
+    
+    elif command == "help":
+        show_help()
+    
+    else:
+        print(f"Error: Unknown command '{command}'")
+        print("Run 'sx-network-optimizer help' for usage information")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

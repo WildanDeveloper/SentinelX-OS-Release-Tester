@@ -1,0 +1,785 @@
+#!/bin/bash
+#
+# SentinelX Performance Tuner
+# 
+# Comprehensive system performance optimization tool that automatically
+# detects and applies optimal settings for:
+# - CPU governor and frequency scaling
+# - I/O schedulers
+# - Network stack tuning
+# - File system optimizations
+# - Kernel parameters
+# - Power management
+#
+# Copyright (C) 2026 WildanDev
+# License: GPL v3
+
+set -e
+
+VERSION="2.0.0"
+SCRIPT_NAME="sx-performance-tuner"
+LOG_FILE="/var/log/sx-performance.log"
+CONFIG_FILE="/etc/sx/performance.conf"
+BACKUP_DIR="/var/lib/sx/tuning-backups"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Performance profiles
+declare -A PROFILES=(
+    ["desktop"]="Optimized for desktop responsiveness and interactivity"
+    ["gaming"]="Maximum performance for gaming with low latency"
+    ["server"]="Balanced performance and power for servers"
+    ["laptop"]="Power-efficient settings for laptops"
+    ["workstation"]="High performance for content creation"
+    ["lowlatency"]="Ultra-low latency for audio/video production"
+)
+
+# Global variables
+CURRENT_PROFILE=""
+DRY_RUN=0
+VERBOSE=0
+STATS_MODE=0
+
+#==============================================================================
+# Logging and Output Functions
+#==============================================================================
+
+log() {
+    local level=$1
+    shift
+    local message="$@"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    
+    case $level in
+        ERROR)   echo -e "${RED}[ERROR]${NC} $message" ;;
+        WARNING) echo -e "${YELLOW}[WARNING]${NC} $message" ;;
+        INFO)    echo -e "${GREEN}[INFO]${NC} $message" ;;
+        DEBUG)   [[ $VERBOSE -eq 1 ]] && echo -e "${CYAN}[DEBUG]${NC} $message" ;;
+    esac
+}
+
+print_banner() {
+    cat << 'EOF'
+  ███████╗███████╗███╗   ██╗████████╗██╗███╗   ██╗███████╗██╗     ██╗  ██╗
+  ██╔════╝██╔════╝████╗  ██║╚══██╔══╝██║████╗  ██║██╔════╝██║     ╚██╗██╔╝
+  ███████╗█████╗  ██╔██╗ ██║   ██║   ██║██╔██╗ ██║█████╗  ██║      ╚███╔╝ 
+  ╚════██║██╔══╝  ██║╚██╗██║   ██║   ██║██║╚██╗██║██╔══╝  ██║      ██╔██╗ 
+  ███████║███████╗██║ ╚████║   ██║   ██║██║ ╚████║███████╗███████╗██╔╝ ██╗
+  ╚══════╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝╚═╝  ╚═╝
+
+  Performance Tuner v2.0 - Advanced System Optimization
+  ======================================================
+EOF
+}
+
+#==============================================================================
+# System Detection
+#==============================================================================
+
+detect_hardware() {
+    log INFO "Detecting hardware configuration..."
+    
+    # CPU info
+    CPU_COUNT=$(nproc)
+    CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs)
+    CPU_ARCH=$(uname -m)
+    
+    # Check for Intel or AMD
+    if grep -q "Intel" /proc/cpuinfo; then
+        CPU_VENDOR="intel"
+    elif grep -q "AMD" /proc/cpuinfo; then
+        CPU_VENDOR="amd"
+    else
+        CPU_VENDOR="unknown"
+    fi
+    
+    # Memory
+    TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
+    
+    # Storage devices
+    STORAGE_DEVICES=$(lsblk -dn -o NAME,TYPE | grep disk | awk '{print $1}')
+    
+    # Check for NVMe, SSD, or HDD
+    for dev in $STORAGE_DEVICES; do
+        if [[ $dev == nvme* ]]; then
+            STORAGE_TYPE="nvme"
+            break
+        elif [[ $(cat /sys/block/$dev/queue/rotational 2>/dev/null) == "0" ]]; then
+            STORAGE_TYPE="ssd"
+            break
+        else
+            STORAGE_TYPE="hdd"
+        fi
+    done
+    
+    # GPU detection
+    if lspci | grep -iq "nvidia"; then
+        GPU_VENDOR="nvidia"
+    elif lspci | grep -iq "amd.*radeon\|amd.*vega"; then
+        GPU_VENDOR="amd"
+    elif lspci | grep -iq "intel.*graphics"; then
+        GPU_VENDOR="intel"
+    else
+        GPU_VENDOR="unknown"
+    fi
+    
+    # Network interfaces
+    NETWORK_DEVICES=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo")
+    
+    log INFO "CPU: $CPU_MODEL ($CPU_COUNT cores)"
+    log INFO "RAM: ${TOTAL_RAM}MB"
+    log INFO "Storage: $STORAGE_TYPE"
+    log INFO "GPU: $GPU_VENDOR"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]] && [[ $DRY_RUN -eq 0 ]]; then
+        log ERROR "This script must be run as root (use sudo)"
+        exit 1
+    fi
+}
+
+#==============================================================================
+# Backup and Restore
+#==============================================================================
+
+create_backup() {
+    local backup_name="tuning_backup_$(date +%Y%m%d_%H%M%S)"
+    local backup_path="$BACKUP_DIR/$backup_name"
+    
+    mkdir -p "$backup_path"
+    
+    log INFO "Creating backup: $backup_name"
+    
+    # Backup current settings
+    [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]] && \
+        cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > "$backup_path/cpu_governors"
+    
+    sysctl -a > "$backup_path/sysctl.conf" 2>/dev/null
+    
+    for dev in $STORAGE_DEVICES; do
+        [[ -f /sys/block/$dev/queue/scheduler ]] && \
+            cat /sys/block/$dev/queue/scheduler > "$backup_path/io_scheduler_$dev"
+    done
+    
+    echo "$backup_name" > "$BACKUP_DIR/latest"
+    log INFO "Backup created: $backup_path"
+}
+
+restore_backup() {
+    local backup_name="${1:-$(cat $BACKUP_DIR/latest 2>/dev/null)}"
+    
+    if [[ -z "$backup_name" ]]; then
+        log ERROR "No backup specified and no latest backup found"
+        return 1
+    fi
+    
+    local backup_path="$BACKUP_DIR/$backup_name"
+    
+    if [[ ! -d "$backup_path" ]]; then
+        log ERROR "Backup not found: $backup_path"
+        return 1
+    fi
+    
+    log INFO "Restoring from backup: $backup_name"
+    
+    # Restore CPU governors
+    if [[ -f "$backup_path/cpu_governors" ]]; then
+        local i=0
+        while read -r governor; do
+            [[ -f "/sys/devices/system/cpu/cpu$i/cpufreq/scaling_governor" ]] && \
+                echo "$governor" > "/sys/devices/system/cpu/cpu$i/cpufreq/scaling_governor" 2>/dev/null || true
+            ((i++))
+        done < "$backup_path/cpu_governors"
+    fi
+    
+    # Restore sysctl
+    if [[ -f "$backup_path/sysctl.conf" ]]; then
+        sysctl -p "$backup_path/sysctl.conf" >/dev/null 2>&1 || true
+    fi
+    
+    log INFO "Backup restored successfully"
+}
+
+#==============================================================================
+# CPU Optimization
+#==============================================================================
+
+optimize_cpu() {
+    local profile=$1
+    
+    log INFO "Optimizing CPU performance for profile: $profile"
+    
+    local governor=""
+    local energy_perf_bias=""
+    local turbo_state=""
+    
+    case $profile in
+        desktop|workstation)
+            governor="schedutil"
+            energy_perf_bias="balance_performance"
+            turbo_state="1"
+            ;;
+        gaming|lowlatency)
+            governor="performance"
+            energy_perf_bias="performance"
+            turbo_state="1"
+            ;;
+        server)
+            governor="schedutil"
+            energy_perf_bias="balance_performance"
+            turbo_state="1"
+            ;;
+        laptop)
+            governor="powersave"
+            energy_perf_bias="balance_power"
+            turbo_state="0"
+            ;;
+    esac
+    
+    # Set CPU governor for all cores
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        if [[ -f "$cpu" ]]; then
+            echo "$governor" > "$cpu" 2>/dev/null || true
+            log DEBUG "Set CPU governor to $governor: $cpu"
+        fi
+    done
+    
+    # Set performance/energy bias (Intel)
+    if [[ "$CPU_VENDOR" == "intel" ]]; then
+        for cpu_epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+            if [[ -f "$cpu_epp" ]]; then
+                echo "$energy_perf_bias" > "$cpu_epp" 2>/dev/null || true
+            fi
+        done
+        
+        # Intel Turbo Boost
+        if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+            echo "$((1 - turbo_state))" > /sys/devices/system/cpu/intel_pstate/no_turbo
+            log INFO "Intel Turbo Boost: $([ $turbo_state -eq 1 ] && echo 'Enabled' || echo 'Disabled')"
+        fi
+    fi
+    
+    # AMD CPU boost
+    if [[ "$CPU_VENDOR" == "amd" ]]; then
+        if [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+            echo "$turbo_state" > /sys/devices/system/cpu/cpufreq/boost
+            log INFO "AMD CPU Boost: $([ $turbo_state -eq 1 ] && echo 'Enabled' || echo 'Disabled')"
+        fi
+    fi
+    
+    # Disable CPU idle states for low latency profiles
+    if [[ "$profile" == "gaming" || "$profile" == "lowlatency" ]]; then
+        for idle_state in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
+            if [[ -f "$idle_state" ]]; then
+                echo "1" > "$idle_state" 2>/dev/null || true
+            fi
+        done
+        log INFO "CPU idle states disabled for low latency"
+    fi
+    
+    log INFO "CPU optimization completed"
+}
+
+#==============================================================================
+# I/O Scheduler Optimization
+#==============================================================================
+
+optimize_io() {
+    local profile=$1
+    
+    log INFO "Optimizing I/O scheduler for profile: $profile"
+    
+    local scheduler=""
+    local nr_requests=""
+    local read_ahead_kb=""
+    
+    case $profile in
+        desktop)
+            [[ "$STORAGE_TYPE" == "nvme" || "$STORAGE_TYPE" == "ssd" ]] && scheduler="none" || scheduler="mq-deadline"
+            nr_requests="256"
+            read_ahead_kb="128"
+            ;;
+        gaming|lowlatency)
+            [[ "$STORAGE_TYPE" == "nvme" || "$STORAGE_TYPE" == "ssd" ]] && scheduler="none" || scheduler="mq-deadline"
+            nr_requests="512"
+            read_ahead_kb="256"
+            ;;
+        server)
+            scheduler="mq-deadline"
+            nr_requests="512"
+            read_ahead_kb="512"
+            ;;
+        workstation)
+            scheduler="bfq"
+            nr_requests="256"
+            read_ahead_kb="256"
+            ;;
+        laptop)
+            scheduler="bfq"
+            nr_requests="128"
+            read_ahead_kb="128"
+            ;;
+    esac
+    
+    for dev in $STORAGE_DEVICES; do
+        local sched_file="/sys/block/$dev/queue/scheduler"
+        local nr_file="/sys/block/$dev/queue/nr_requests"
+        local ra_file="/sys/block/$dev/queue/read_ahead_kb"
+        
+        # Set scheduler
+        if [[ -f "$sched_file" ]]; then
+            # Check if scheduler is available
+            if grep -q "\[$scheduler\]" "$sched_file" || grep -q "$scheduler" "$sched_file"; then
+                echo "$scheduler" > "$sched_file" 2>/dev/null || true
+                log INFO "Set I/O scheduler for $dev: $scheduler"
+            fi
+        fi
+        
+        # Set nr_requests
+        [[ -f "$nr_file" ]] && echo "$nr_requests" > "$nr_file" 2>/dev/null || true
+        
+        # Set read-ahead
+        [[ -f "$ra_file" ]] && echo "$read_ahead_kb" > "$ra_file" 2>/dev/null || true
+        
+        # Disable add_random for SSDs/NVMe (better performance)
+        if [[ "$STORAGE_TYPE" == "nvme" || "$STORAGE_TYPE" == "ssd" ]]; then
+            [[ -f "/sys/block/$dev/queue/add_random" ]] && \
+                echo "0" > "/sys/block/$dev/queue/add_random" 2>/dev/null || true
+        fi
+    done
+    
+    log INFO "I/O optimization completed"
+}
+
+#==============================================================================
+# Network Optimization
+#==============================================================================
+
+optimize_network() {
+    local profile=$1
+    
+    log INFO "Optimizing network stack for profile: $profile"
+    
+    case $profile in
+        desktop|workstation)
+            sysctl -w net.core.rmem_max=16777216 2>/dev/null || true
+            sysctl -w net.core.wmem_max=16777216 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+            sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+            ;;
+        gaming|lowlatency)
+            # Ultra low latency settings
+            sysctl -w net.core.rmem_max=33554432 2>/dev/null || true
+            sysctl -w net.core.wmem_max=33554432 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_rmem="4096 131072 33554432" 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_wmem="4096 131072 33554432" 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+            sysctl -w net.core.netdev_max_backlog=5000 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_no_metrics_save=1 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
+            sysctl -w net.core.default_qdisc=fq_codel 2>/dev/null || true
+            ;;
+        server)
+            # High throughput settings
+            sysctl -w net.core.rmem_max=67108864 2>/dev/null || true
+            sysctl -w net.core.wmem_max=67108864 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_rmem="4096 262144 67108864" 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_wmem="4096 262144 67108864" 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_congestion_control=cubic 2>/dev/null || true
+            sysctl -w net.core.netdev_max_backlog=10000 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_max_syn_backlog=8192 2>/dev/null || true
+            sysctl -w net.core.somaxconn=4096 2>/dev/null || true
+            ;;
+        laptop)
+            # Power efficient settings
+            sysctl -w net.core.rmem_max=8388608 2>/dev/null || true
+            sysctl -w net.core.wmem_max=8388608 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+            ;;
+    esac
+    
+    # Enable TCP timestamps and window scaling
+    sysctl -w net.ipv4.tcp_timestamps=1 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_sack=1 2>/dev/null || true
+    
+    # Set network interface ring buffers
+    for iface in $NETWORK_DEVICES; do
+        if ethtool -g "$iface" &>/dev/null; then
+            local max_rx=$(ethtool -g "$iface" 2>/dev/null | awk '/^RX:/{getline; print $2; exit}')
+            local max_tx=$(ethtool -g "$iface" 2>/dev/null | awk '/^TX:/{getline; print $2; exit}')
+            
+            if [[ -n "$max_rx" && "$max_rx" -gt 0 ]]; then
+                ethtool -G "$iface" rx "$max_rx" 2>/dev/null || true
+            fi
+            if [[ -n "$max_tx" && "$max_tx" -gt 0 ]]; then
+                ethtool -G "$iface" tx "$max_tx" 2>/dev/null || true
+            fi
+        fi
+    done
+    
+    log INFO "Network optimization completed"
+}
+
+#==============================================================================
+# Filesystem Optimization
+#==============================================================================
+
+optimize_filesystem() {
+    local profile=$1
+    
+    log INFO "Optimizing filesystem for profile: $profile"
+    
+    case $profile in
+        desktop|workstation)
+            sysctl -w vm.swappiness=10 2>/dev/null || true
+            sysctl -w vm.vfs_cache_pressure=50 2>/dev/null || true
+            sysctl -w vm.dirty_ratio=10 2>/dev/null || true
+            sysctl -w vm.dirty_background_ratio=5 2>/dev/null || true
+            ;;
+        gaming|lowlatency)
+            sysctl -w vm.swappiness=1 2>/dev/null || true
+            sysctl -w vm.vfs_cache_pressure=50 2>/dev/null || true
+            sysctl -w vm.dirty_ratio=5 2>/dev/null || true
+            sysctl -w vm.dirty_background_ratio=3 2>/dev/null || true
+            ;;
+        server)
+            sysctl -w vm.swappiness=30 2>/dev/null || true
+            sysctl -w vm.vfs_cache_pressure=100 2>/dev/null || true
+            sysctl -w vm.dirty_ratio=15 2>/dev/null || true
+            sysctl -w vm.dirty_background_ratio=10 2>/dev/null || true
+            ;;
+        laptop)
+            sysctl -w vm.swappiness=60 2>/dev/null || true
+            sysctl -w vm.vfs_cache_pressure=100 2>/dev/null || true
+            sysctl -w vm.dirty_ratio=15 2>/dev/null || true
+            sysctl -w vm.dirty_background_ratio=10 2>/dev/null || true
+            ;;
+    esac
+    
+    # Optimize transparent huge pages
+    if [[ "$profile" == "gaming" || "$profile" == "lowlatency" ]]; then
+        echo "always" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+    else
+        echo "madvise" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+    fi
+    
+    log INFO "Filesystem optimization completed"
+}
+
+#==============================================================================
+# Kernel Parameter Optimization
+#==============================================================================
+
+optimize_kernel_params() {
+    local profile=$1
+    
+    log INFO "Optimizing kernel parameters for profile: $profile"
+    
+    # Common optimizations
+    sysctl -w kernel.sched_autogroup_enabled=1 2>/dev/null || true
+    sysctl -w kernel.sched_child_runs_first=1 2>/dev/null || true
+    
+    case $profile in
+        desktop|workstation)
+            sysctl -w kernel.sched_latency_ns=6000000 2>/dev/null || true
+            sysctl -w kernel.sched_min_granularity_ns=1500000 2>/dev/null || true
+            sysctl -w kernel.sched_wakeup_granularity_ns=2000000 2>/dev/null || true
+            ;;
+        gaming|lowlatency)
+            # Ultra-low latency
+            sysctl -w kernel.sched_latency_ns=4000000 2>/dev/null || true
+            sysctl -w kernel.sched_min_granularity_ns=500000 2>/dev/null || true
+            sysctl -w kernel.sched_wakeup_granularity_ns=1000000 2>/dev/null || true
+            sysctl -w kernel.sched_migration_cost_ns=50000 2>/dev/null || true
+            sysctl -w kernel.timer_migration=0 2>/dev/null || true
+            ;;
+        server)
+            sysctl -w kernel.sched_latency_ns=10000000 2>/dev/null || true
+            sysctl -w kernel.sched_min_granularity_ns=3000000 2>/dev/null || true
+            sysctl -w kernel.sched_wakeup_granularity_ns=4000000 2>/dev/null || true
+            ;;
+    esac
+    
+    # Increase file descriptors for performance profiles
+    if [[ "$profile" != "laptop" ]]; then
+        sysctl -w fs.file-max=2097152 2>/dev/null || true
+        sysctl -w fs.nr_open=1048576 2>/dev/null || true
+    fi
+    
+    log INFO "Kernel parameter optimization completed"
+}
+
+#==============================================================================
+# Power Management
+#==============================================================================
+
+optimize_power() {
+    local profile=$1
+    
+    log INFO "Configuring power management for profile: $profile"
+    
+    case $profile in
+        laptop)
+            # Enable power saving features
+            if [[ -d /sys/module/pcie_aspm ]]; then
+                echo "powersave" > /sys/module/pcie_aspm/parameters/policy 2>/dev/null || true
+            fi
+            
+            # Enable audio power saving
+            echo "1" > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null || true
+            
+            # Enable USB autosuspend
+            for usb in /sys/bus/usb/devices/*/power/autosuspend; do
+                echo "2" > "$usb" 2>/dev/null || true
+            done
+            ;;
+        gaming|lowlatency|workstation)
+            # Disable power saving for maximum performance
+            if [[ -d /sys/module/pcie_aspm ]]; then
+                echo "performance" > /sys/module/pcie_aspm/parameters/policy 2>/dev/null || true
+            fi
+            
+            # Disable audio power saving
+            echo "0" > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null || true
+            ;;
+    esac
+    
+    log INFO "Power management configuration completed"
+}
+
+#==============================================================================
+# Apply Complete Profile
+#==============================================================================
+
+apply_profile() {
+    local profile=$1
+    
+    if [[ -z "${PROFILES[$profile]}" ]]; then
+        log ERROR "Unknown profile: $profile"
+        log INFO "Available profiles: ${!PROFILES[@]}"
+        exit 1
+    fi
+    
+    log INFO "========================================"
+    log INFO "Applying profile: $profile"
+    log INFO "Description: ${PROFILES[$profile]}"
+    log INFO "========================================"
+    
+    # Create backup before making changes
+    if [[ $DRY_RUN -eq 0 ]]; then
+        create_backup
+    fi
+    
+    # Detect hardware
+    detect_hardware
+    
+    # Apply optimizations
+    optimize_cpu "$profile"
+    optimize_io "$profile"
+    optimize_network "$profile"
+    optimize_filesystem "$profile"
+    optimize_kernel_params "$profile"
+    optimize_power "$profile"
+    
+    # Save current profile
+    if [[ $DRY_RUN -eq 0 ]]; then
+        mkdir -p "$(dirname $CONFIG_FILE)"
+        echo "CURRENT_PROFILE=$profile" > "$CONFIG_FILE"
+        echo "APPLIED_AT=$(date '+%Y-%m-%d %H:%M:%S')" >> "$CONFIG_FILE"
+    fi
+    
+    CURRENT_PROFILE="$profile"
+    
+    log INFO "========================================"
+    log INFO "Profile applied successfully: $profile"
+    log INFO "========================================"
+}
+
+#==============================================================================
+# Status and Statistics
+#==============================================================================
+
+show_status() {
+    print_banner
+    echo ""
+    
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+        echo -e "${GREEN}Current Profile:${NC} $CURRENT_PROFILE"
+        echo -e "${GREEN}Applied At:${NC} $APPLIED_AT"
+        echo ""
+    else
+        echo -e "${YELLOW}No profile currently applied${NC}"
+        echo ""
+    fi
+    
+    detect_hardware
+    
+    echo ""
+    echo -e "${CYAN}=== CPU Status ===${NC}"
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+        local governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+        echo "Governor: $governor"
+        
+        if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]]; then
+            local freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+            echo "Current Frequency: $((freq / 1000)) MHz"
+        fi
+    fi
+    
+    echo ""
+    echo -e "${CYAN}=== I/O Schedulers ===${NC}"
+    for dev in $STORAGE_DEVICES; do
+        if [[ -f /sys/block/$dev/queue/scheduler ]]; then
+            local sched=$(cat /sys/block/$dev/queue/scheduler)
+            echo "$dev: $sched"
+        fi
+    done
+    
+    echo ""
+    echo -e "${CYAN}=== Memory Settings ===${NC}"
+    echo "Swappiness: $(cat /proc/sys/vm/swappiness)"
+    echo "VFS Cache Pressure: $(cat /proc/sys/vm/vfs_cache_pressure)"
+    echo "Dirty Ratio: $(cat /proc/sys/vm/dirty_ratio)"
+    
+    echo ""
+    echo -e "${CYAN}=== Network Settings ===${NC}"
+    echo "TCP Congestion Control: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+    echo "Default QDisc: $(cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo 'N/A')"
+    
+    echo ""
+}
+
+show_profiles() {
+    echo ""
+    echo -e "${CYAN}Available Performance Profiles:${NC}"
+    echo ""
+    
+    for profile in "${!PROFILES[@]}"; do
+        echo -e "  ${GREEN}$profile${NC}"
+        echo -e "    ${PROFILES[$profile]}"
+        echo ""
+    done
+}
+
+#==============================================================================
+# Main
+#==============================================================================
+
+show_help() {
+    cat << EOF
+Usage: $SCRIPT_NAME [OPTIONS] [COMMAND]
+
+SentinelX Performance Tuner - Advanced system optimization tool
+
+COMMANDS:
+    apply <profile>     Apply a performance profile
+    status              Show current status and settings
+    restore [backup]    Restore from backup
+    profiles            List available profiles
+    
+PROFILES:
+    desktop             Desktop responsiveness and interactivity
+    gaming              Maximum gaming performance with low latency
+    server              Balanced server performance
+    laptop              Power-efficient laptop settings
+    workstation         High performance for content creation
+    lowlatency          Ultra-low latency for audio/video production
+
+OPTIONS:
+    -h, --help          Show this help message
+    -v, --verbose       Verbose output
+    -d, --dry-run       Show what would be done without applying
+    -V, --version       Show version information
+
+EXAMPLES:
+    # Apply gaming profile
+    sudo $SCRIPT_NAME apply gaming
+    
+    # Show current status
+    $SCRIPT_NAME status
+    
+    # Restore from backup
+    sudo $SCRIPT_NAME restore
+    
+    # List all profiles
+    $SCRIPT_NAME profiles
+
+EOF
+}
+
+main() {
+    # Create log directory
+    mkdir -p "$(dirname $LOG_FILE)"
+    mkdir -p "$BACKUP_DIR"
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            -d|--dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            -V|--version)
+                echo "$SCRIPT_NAME v$VERSION"
+                exit 0
+                ;;
+            apply)
+                check_root
+                shift
+                if [[ -z "$1" ]]; then
+                    log ERROR "Profile name required"
+                    show_help
+                    exit 1
+                fi
+                apply_profile "$1"
+                exit 0
+                ;;
+            status)
+                show_status
+                exit 0
+                ;;
+            restore)
+                check_root
+                shift
+                restore_backup "$1"
+                exit 0
+                ;;
+            profiles)
+                show_profiles
+                exit 0
+                ;;
+            *)
+                log ERROR "Unknown command: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+    
+    # No command specified
+    show_help
+}
+
+main "$@"

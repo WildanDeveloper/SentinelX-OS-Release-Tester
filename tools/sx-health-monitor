@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""
+SentinelX System Health Monitor
+
+Real-time system health monitoring and alerting daemon that tracks:
+- CPU temperature and throttling
+- Memory pressure and OOM risks
+- Disk health (SMART status)
+- Network connectivity issues
+- System load and performance degradation
+- Service failures
+- Security events
+- Hardware failures
+
+Copyright (C) 2026 WildanDev
+License: GPL v3
+"""
+
+import os
+import sys
+import time
+import json
+import subprocess
+import psutil
+import signal
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from collections import deque
+from pathlib import Path
+
+# Configuration
+CONFIG_FILE = "/etc/sx/health-monitor.conf"
+LOG_FILE = "/var/log/sx-health-monitor.log"
+STATE_FILE = "/var/run/sx-health-monitor.state"
+ALERT_HISTORY_SIZE = 100
+CHECK_INTERVAL = 5  # seconds
+
+# Thresholds
+CPU_TEMP_WARNING = 70  # Celsius
+CPU_TEMP_CRITICAL = 85
+MEMORY_WARNING = 85  # Percent
+MEMORY_CRITICAL = 95
+DISK_WARNING = 85
+DISK_CRITICAL = 95
+LOAD_WARNING_MULTIPLIER = 2.0  # times CPU count
+LOAD_CRITICAL_MULTIPLIER = 4.0
+
+@dataclass
+class HealthStatus:
+    """System health status"""
+    timestamp: str
+    overall_health: str  # healthy, warning, critical
+    cpu_temp: float
+    cpu_usage: float
+    memory_usage: float
+    swap_usage: float
+    disk_usage: Dict[str, float]
+    load_average: Tuple[float, float, float]
+    active_alerts: List[str]
+    services_down: List[str]
+
+@dataclass
+class Alert:
+    """Health alert"""
+    timestamp: str
+    severity: str  # info, warning, critical
+    category: str
+    message: str
+    resolved: bool = False
+
+class HealthMonitor:
+    """System health monitoring daemon"""
+    
+    def __init__(self):
+        self.running = False
+        self.alerts: deque = deque(maxlen=ALERT_HISTORY_SIZE)
+        self.active_alerts: Dict[str, Alert] = {}
+        self.last_status: Optional[HealthStatus] = None
+        self.critical_services = [
+            "sshd", "NetworkManager", "systemd-journald"
+        ]
+        
+        # Setup logging
+        logging.basicConfig(
+            filename=LOG_FILE,
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def get_cpu_temperature(self) -> Optional[float]:
+        """Get CPU temperature in Celsius"""
+        try:
+            # Try reading from thermal zones
+            thermal_paths = list(Path("/sys/class/thermal").glob("thermal_zone*/temp"))
+            if thermal_paths:
+                temps = []
+                for path in thermal_paths:
+                    try:
+                        temp = int(path.read_text().strip()) / 1000.0
+                        temps.append(temp)
+                    except:
+                        continue
+                return max(temps) if temps else None
+            
+            # Try sensors command
+            result = subprocess.run(['sensors', '-u'], 
+                                  capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'temp' in line.lower() and 'input' in line.lower():
+                        try:
+                            temp = float(line.split(':')[1].strip())
+                            if 0 < temp < 200:  # Sanity check
+                                return temp
+                        except:
+                            continue
+        except:
+            pass
+        return None
+    
+    def check_disk_health(self) -> Dict[str, Dict]:
+        """Check SMART status of disks"""
+        health_status = {}
+        
+        try:
+            # Get list of disks
+            result = subprocess.run(['lsblk', '-dn', '-o', 'NAME,TYPE'],
+                                  capture_output=True, text=True)
+            if result.returncode != 0:
+                return health_status
+            
+            disks = [line.split()[0] for line in result.stdout.strip().split('\n')
+                    if 'disk' in line]
+            
+            for disk in disks:
+                try:
+                    # Check SMART status
+                    result = subprocess.run(
+                        ['smartctl', '-H', f'/dev/{disk}'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    
+                    status = "unknown"
+                    if "PASSED" in result.stdout:
+                        status = "healthy"
+                    elif "FAILED" in result.stdout:
+                        status = "failing"
+                    
+                    # Get temperature
+                    result = subprocess.run(
+                        ['smartctl', '-A', f'/dev/{disk}'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    
+                    temp = None
+                    for line in result.stdout.split('\n'):
+                        if 'Temperature' in line or 'temperature' in line:
+                            parts = line.split()
+                            try:
+                                temp = int(parts[-1])
+                                break
+                            except:
+                                continue
+                    
+                    health_status[disk] = {
+                        'status': status,
+                        'temperature': temp
+                    }
+                except:
+                    continue
+        except:
+            pass
+        
+        return health_status
+    
+    def check_services(self) -> List[str]:
+        """Check critical services status"""
+        failed_services = []
+        
+        for service in self.critical_services:
+            try:
+                result = subprocess.run(
+                    ['systemctl', 'is-active', service],
+                    capture_output=True, text=True, timeout=2
+                )
+                if result.returncode != 0:
+                    failed_services.append(service)
+            except:
+                continue
+        
+        return failed_services
+    
+    def check_network(self) -> bool:
+        """Check network connectivity"""
+        try:
+            # Ping Google DNS
+            result = subprocess.run(
+                ['ping', '-c', '1', '-W', '2', '8.8.8.8'],
+                capture_output=True, timeout=3
+            )
+            return result.returncode == 0
+        except:
+            return False
+    
+    def create_alert(self, severity: str, category: str, message: str) -> Alert:
+        """Create a new alert"""
+        alert = Alert(
+            timestamp=datetime.now().isoformat(),
+            severity=severity,
+            category=category,
+            message=message
+        )
+        
+        self.alerts.append(alert)
+        self.logger.log(
+            logging.WARNING if severity == "warning" else logging.ERROR,
+            f"[{category}] {message}"
+        )
+        
+        return alert
+    
+    def resolve_alert(self, alert_key: str):
+        """Resolve an active alert"""
+        if alert_key in self.active_alerts:
+            alert = self.active_alerts[alert_key]
+            alert.resolved = True
+            del self.active_alerts[alert_key]
+            self.logger.info(f"Alert resolved: {alert.message}")
+    
+    def check_health(self) -> HealthStatus:
+        """Perform comprehensive health check"""
+        now = datetime.now().isoformat()
+        overall_health = "healthy"
+        current_alerts = []
+        
+        # CPU Temperature
+        cpu_temp = self.get_cpu_temperature()
+        if cpu_temp:
+            if cpu_temp >= CPU_TEMP_CRITICAL:
+                overall_health = "critical"
+                alert_key = "cpu_temp_critical"
+                if alert_key not in self.active_alerts:
+                    alert = self.create_alert(
+                        "critical", "CPU",
+                        f"CPU temperature critical: {cpu_temp:.1f}°C"
+                    )
+                    self.active_alerts[alert_key] = alert
+                current_alerts.append(alert_key)
+            elif cpu_temp >= CPU_TEMP_WARNING:
+                if overall_health == "healthy":
+                    overall_health = "warning"
+                alert_key = "cpu_temp_warning"
+                if alert_key not in self.active_alerts:
+                    alert = self.create_alert(
+                        "warning", "CPU",
+                        f"CPU temperature high: {cpu_temp:.1f}°C"
+                    )
+                    self.active_alerts[alert_key] = alert
+                current_alerts.append(alert_key)
+        
+        # CPU Usage
+        cpu_usage = psutil.cpu_percent(interval=1)
+        
+        # Memory Usage
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent
+        
+        if memory_percent >= MEMORY_CRITICAL:
+            overall_health = "critical"
+            alert_key = "memory_critical"
+            if alert_key not in self.active_alerts:
+                alert = self.create_alert(
+                    "critical", "Memory",
+                    f"Memory usage critical: {memory_percent:.1f}%"
+                )
+                self.active_alerts[alert_key] = alert
+            current_alerts.append(alert_key)
+        elif memory_percent >= MEMORY_WARNING:
+            if overall_health == "healthy":
+                overall_health = "warning"
+            alert_key = "memory_warning"
+            if alert_key not in self.active_alerts:
+                alert = self.create_alert(
+                    "warning", "Memory",
+                    f"Memory usage high: {memory_percent:.1f}%"
+                )
+                self.active_alerts[alert_key] = alert
+            current_alerts.append(alert_key)
+        
+        # Swap Usage
+        swap = psutil.swap_memory()
+        swap_percent = swap.percent
+        
+        # Disk Usage
+        disk_usage = {}
+        for partition in psutil.disk_partitions():
+            try:
+                usage = psutil.disk_usage(partition.mountpoint)
+                disk_usage[partition.mountpoint] = usage.percent
+                
+                if usage.percent >= DISK_CRITICAL:
+                    overall_health = "critical"
+                    alert_key = f"disk_critical_{partition.mountpoint}"
+                    if alert_key not in self.active_alerts:
+                        alert = self.create_alert(
+                            "critical", "Disk",
+                            f"Disk {partition.mountpoint} critical: {usage.percent:.1f}%"
+                        )
+                        self.active_alerts[alert_key] = alert
+                    current_alerts.append(alert_key)
+                elif usage.percent >= DISK_WARNING:
+                    if overall_health == "healthy":
+                        overall_health = "warning"
+                    alert_key = f"disk_warning_{partition.mountpoint}"
+                    if alert_key not in self.active_alerts:
+                        alert = self.create_alert(
+                            "warning", "Disk",
+                            f"Disk {partition.mountpoint} high: {usage.percent:.1f}%"
+                        )
+                        self.active_alerts[alert_key] = alert
+                    current_alerts.append(alert_key)
+            except:
+                continue
+        
+        # Load Average
+        load_avg = os.getloadavg()
+        cpu_count = psutil.cpu_count()
+        load_threshold_critical = cpu_count * LOAD_CRITICAL_MULTIPLIER
+        load_threshold_warning = cpu_count * LOAD_WARNING_MULTIPLIER
+        
+        if load_avg[0] >= load_threshold_critical:
+            overall_health = "critical"
+            alert_key = "load_critical"
+            if alert_key not in self.active_alerts:
+                alert = self.create_alert(
+                    "critical", "Load",
+                    f"System load critical: {load_avg[0]:.2f}"
+                )
+                self.active_alerts[alert_key] = alert
+            current_alerts.append(alert_key)
+        elif load_avg[0] >= load_threshold_warning:
+            if overall_health == "healthy":
+                overall_health = "warning"
+            alert_key = "load_warning"
+            if alert_key not in self.active_alerts:
+                alert = self.create_alert(
+                    "warning", "Load",
+                    f"System load high: {load_avg[0]:.2f}"
+                )
+                self.active_alerts[alert_key] = alert
+            current_alerts.append(alert_key)
+        
+        # Check Services
+        failed_services = self.check_services()
+        if failed_services:
+            overall_health = "critical"
+            for service in failed_services:
+                alert_key = f"service_down_{service}"
+                if alert_key not in self.active_alerts:
+                    alert = self.create_alert(
+                        "critical", "Service",
+                        f"Critical service down: {service}"
+                    )
+                    self.active_alerts[alert_key] = alert
+                current_alerts.append(alert_key)
+        
+        # Check Network
+        if not self.check_network():
+            if overall_health == "healthy":
+                overall_health = "warning"
+            alert_key = "network_down"
+            if alert_key not in self.active_alerts:
+                alert = self.create_alert(
+                    "warning", "Network",
+                    "Network connectivity issue detected"
+                )
+                self.active_alerts[alert_key] = alert
+            current_alerts.append(alert_key)
+        
+        # Resolve alerts that are no longer active
+        for alert_key in list(self.active_alerts.keys()):
+            if alert_key not in current_alerts:
+                self.resolve_alert(alert_key)
+        
+        status = HealthStatus(
+            timestamp=now,
+            overall_health=overall_health,
+            cpu_temp=cpu_temp or 0.0,
+            cpu_usage=cpu_usage,
+            memory_usage=memory_percent,
+            swap_usage=swap_percent,
+            disk_usage=disk_usage,
+            load_average=load_avg,
+            active_alerts=[a.message for a in self.active_alerts.values()],
+            services_down=failed_services
+        )
+        
+        self.last_status = status
+        return status
+    
+    def display_status(self, status: HealthStatus):
+        """Display current health status"""
+        # Clear screen
+        os.system('clear')
+        
+        print("\n" + "="*70)
+        print(f"  SENTINELX SYSTEM HEALTH MONITOR - {datetime.now().strftime('%H:%M:%S')}")
+        print("="*70)
+        
+        # Overall Health
+        health_color = {
+            "healthy": "\033[92m",  # Green
+            "warning": "\033[93m",  # Yellow
+            "critical": "\033[91m"  # Red
+        }
+        color = health_color.get(status.overall_health, "")
+        reset = "\033[0m"
+        
+        print(f"\nOverall Health: {color}{status.overall_health.upper()}{reset}")
+        
+        # CPU
+        print(f"\n{color}CPU:{reset}")
+        print(f"  Temperature: {status.cpu_temp:.1f}°C")
+        print(f"  Usage: {status.cpu_usage:.1f}%")
+        print(f"  Load Average: {status.load_average[0]:.2f}, {status.load_average[1]:.2f}, {status.load_average[2]:.2f}")
+        
+        # Memory
+        print(f"\n{color}Memory:{reset}")
+        print(f"  RAM Usage: {status.memory_usage:.1f}%")
+        print(f"  Swap Usage: {status.swap_usage:.1f}%")
+        
+        # Disk
+        print(f"\n{color}Disk Usage:{reset}")
+        for mount, usage in status.disk_usage.items():
+            print(f"  {mount}: {usage:.1f}%")
+        
+        # Services
+        if status.services_down:
+            print(f"\n{color}⚠ Services Down:{reset}")
+            for service in status.services_down:
+                print(f"  • {service}")
+        
+        # Active Alerts
+        if status.active_alerts:
+            print(f"\n{color}⚠ Active Alerts:{reset}")
+            for alert in status.active_alerts:
+                print(f"  • {alert}")
+        else:
+            print(f"\n{color}✓ No active alerts{reset}")
+        
+        print("\n" + "="*70)
+        print("Press Ctrl+C to stop monitoring")
+    
+    def save_state(self):
+        """Save current state to file"""
+        try:
+            if self.last_status:
+                state = {
+                    'status': asdict(self.last_status),
+                    'alerts': [asdict(a) for a in self.alerts]
+                }
+                with open(STATE_FILE, 'w') as f:
+                    json.dump(state, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Failed to save state: {e}")
+    
+    def load_state(self):
+        """Load previous state from file"""
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, 'r') as f:
+                    state = json.load(f)
+                    # Restore alerts
+                    for alert_dict in state.get('alerts', []):
+                        alert = Alert(**alert_dict)
+                        self.alerts.append(alert)
+        except Exception as e:
+            self.logger.error(f"Failed to load state: {e}")
+    
+    def run(self):
+        """Run monitoring daemon"""
+        self.running = True
+        self.load_state()
+        
+        print("\nSentinelX System Health Monitor starting...")
+        self.logger.info("Health monitor daemon started")
+        
+        try:
+            while self.running:
+                status = self.check_health()
+                self.display_status(status)
+                self.save_state()
+                time.sleep(CHECK_INTERVAL)
+        except KeyboardInterrupt:
+            print("\n\nStopping health monitor...")
+            self.running = False
+            self.save_state()
+            self.logger.info("Health monitor daemon stopped")
+
+def show_help():
+    """Show help message"""
+    print("""
+SentinelX System Health Monitor v2.0
+
+Usage: sx-health-monitor [COMMAND]
+
+COMMANDS:
+    start       Start health monitoring daemon (interactive)
+    status      Show current system health status
+    alerts      Show alert history
+    check       Perform one-time health check
+    help        Show this help message
+
+The health monitor tracks:
+- CPU temperature and usage
+- Memory and swap usage
+- Disk space and health (SMART)
+- System load average
+- Critical system services
+- Network connectivity
+
+THRESHOLDS:
+- CPU Temperature: Warning at 70°C, Critical at 85°C
+- Memory Usage: Warning at 85%, Critical at 95%
+- Disk Usage: Warning at 85%, Critical at 95%
+- Load Average: Warning at 2x CPU count, Critical at 4x CPU count
+
+""")
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) < 2:
+        command = "start"
+    else:
+        command = sys.argv[1].lower()
+    
+    monitor = HealthMonitor()
+    
+    if command == "start":
+        monitor.run()
+    elif command == "status":
+        status = monitor.check_health()
+        monitor.display_status(status)
+    elif command == "alerts":
+        monitor.load_state()
+        print("\nAlert History:")
+        print("="*70)
+        for alert in reversed(list(monitor.alerts)):
+            print(f"[{alert.timestamp}] {alert.severity.upper()}: {alert.message}")
+            if alert.resolved:
+                print("  (Resolved)")
+        print()
+    elif command == "check":
+        print("Performing health check...")
+        status = monitor.check_health()
+        print(f"\nOverall Health: {status.overall_health.upper()}")
+        if status.active_alerts:
+            print("\nActive Alerts:")
+            for alert in status.active_alerts:
+                print(f"  • {alert}")
+        else:
+            print("\n✓ All systems healthy")
+        print()
+    elif command == "help":
+        show_help()
+    else:
+        print(f"Error: Unknown command '{command}'")
+        print("Run 'sx-health-monitor help' for usage information")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

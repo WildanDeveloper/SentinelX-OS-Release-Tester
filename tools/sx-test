@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+SentinelX OS - Automated Testing Framework
+Comprehensive system testing suite
+"""
+
+import os
+import sys
+import subprocess
+import json
+from datetime import datetime
+from pathlib import Path
+
+class SentinelXTester:
+    def __init__(self):
+        self.test_results = []
+        self.passed = 0
+        self.failed = 0
+        self.warnings = 0
+        
+        self.report_dir = Path("/var/log/sentinelx/tests")
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+    
+    def run_command(self, cmd):
+        """Run shell command and return result"""
+        try:
+            result = subprocess.run(
+                cmd, 
+                shell=True, 
+                capture_output=True, 
+                text=True, 
+                timeout=30
+            )
+            return result.returncode == 0, result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            return False, "", "Command timed out"
+        except Exception as e:
+            return False, "", str(e)
+    
+    def test(self, name, description, check_func):
+        """Run a test"""
+        print(f"  Testing: {description}...", end=' ')
+        
+        try:
+            success, message = check_func()
+            
+            if success:
+                print("✓ PASS")
+                status = "PASS"
+                self.passed += 1
+            else:
+                print("✗ FAIL")
+                status = "FAIL"
+                self.failed += 1
+            
+            self.test_results.append({
+                'name': name,
+                'description': description,
+                'status': status,
+                'message': message,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            return success
+        
+        except Exception as e:
+            print(f"✗ ERROR: {e}")
+            self.failed += 1
+            self.test_results.append({
+                'name': name,
+                'description': description,
+                'status': 'ERROR',
+                'message': str(e),
+                'timestamp': datetime.now().isoformat()
+            })
+            return False
+    
+    def test_kernel(self):
+        """Test kernel functionality"""
+        print("\n🔬 Kernel Tests")
+        print("=" * 60)
+        
+        def check_kernel_version():
+            success, stdout, _ = self.run_command("uname -r")
+            if success and "6.12" in stdout:
+                return True, f"Kernel version: {stdout.strip()}"
+            return False, "Kernel version mismatch"
+        
+        def check_kernel_modules():
+            success, stdout, _ = self.run_command("lsmod | wc -l")
+            if success:
+                count = int(stdout.strip())
+                return True, f"Loaded modules: {count}"
+            return False, "Cannot check modules"
+        
+        def check_kernel_params():
+            success, stdout, _ = self.run_command("cat /proc/cmdline")
+            if success:
+                return True, f"Kernel parameters loaded"
+            return False, "Cannot read kernel parameters"
+        
+        self.test('kernel_version', 'Kernel version check', check_kernel_version)
+        self.test('kernel_modules', 'Kernel modules check', check_kernel_modules)
+        self.test('kernel_params', 'Kernel parameters check', check_kernel_params)
+    
+    def test_packages(self):
+        """Test package management system"""
+        print("\n📦 Package Management Tests")
+        print("=" * 60)
+        
+        def check_pacman():
+            success, _, _ = self.run_command("which pacman")
+            return success, "Pacman available" if success else "Pacman not found"
+        
+        def check_rpm():
+            success, _, _ = self.run_command("which rpm")
+            return success, "RPM available" if success else "RPM not found"
+        
+        def check_sx_pkg():
+            sx_pkg_path = "/usr/bin/sx-pkg"
+            if Path(sx_pkg_path).exists():
+                return True, "sx-pkg installed"
+            return False, "sx-pkg not found"
+        
+        self.test('pacman', 'Pacman package manager', check_pacman)
+        self.test('rpm', 'RPM package manager', check_rpm)
+        self.test('sx_pkg', 'SX unified package manager', check_sx_pkg)
+    
+    def test_security(self):
+        """Test security layers"""
+        print("\n🛡️  Security Tests")
+        print("=" * 60)
+        
+        def check_apparmor():
+            success, stdout, _ = self.run_command("systemctl is-active apparmor")
+            if success and "active" in stdout:
+                return True, "AppArmor active"
+            return False, "AppArmor not active"
+        
+        def check_selinux():
+            success, stdout, _ = self.run_command("getenforce")
+            if success:
+                mode = stdout.strip()
+                return True, f"SELinux mode: {mode}"
+            return False, "SELinux status unknown"
+        
+        def check_firewall():
+            success, stdout, _ = self.run_command("systemctl is-active firewalld")
+            if success and "active" in stdout:
+                return True, "Firewall active"
+            return False, "Firewall not active"
+        
+        self.test('apparmor', 'AppArmor security module', check_apparmor)
+        self.test('selinux', 'SELinux security module', check_selinux)
+        self.test('firewall', 'Firewall service', check_firewall)
+    
+    def test_filesystem(self):
+        """Test filesystem and storage"""
+        print("\n💾 Filesystem Tests")
+        print("=" * 60)
+        
+        def check_btrfs():
+            success, stdout, _ = self.run_command("df -T / | grep btrfs")
+            if success and stdout:
+                return True, "Root filesystem is Btrfs"
+            return False, "Root filesystem is not Btrfs"
+        
+        def check_disk_space():
+            success, stdout, _ = self.run_command("df -h / | tail -1 | awk '{print $5}' | tr -d %")
+            if success:
+                usage = int(stdout.strip())
+                if usage < 90:
+                    return True, f"Disk usage: {usage}%"
+                return False, f"Disk usage critical: {usage}%"
+            return False, "Cannot check disk space"
+        
+        def check_mount_points():
+            success, stdout, _ = self.run_command("mount | wc -l")
+            if success:
+                count = int(stdout.strip())
+                return True, f"Mount points: {count}"
+            return False, "Cannot check mount points"
+        
+        self.test('btrfs', 'Btrfs filesystem', check_btrfs)
+        self.test('disk_space', 'Disk space check', check_disk_space)
+        self.test('mount_points', 'Mount points check', check_mount_points)
+    
+    def test_services(self):
+        """Test system services"""
+        print("\n⚙️  System Services Tests")
+        print("=" * 60)
+        
+        def check_systemd():
+            success, _, _ = self.run_command("systemctl --version")
+            return success, "systemd available" if success else "systemd not found"
+        
+        def check_network():
+            success, _, _ = self.run_command("systemctl is-active NetworkManager")
+            return success, "NetworkManager active" if success else "NetworkManager inactive"
+        
+        def check_ssh():
+            success, _, _ = self.run_command("systemctl is-active sshd")
+            return success, "SSH server active" if success else "SSH server inactive"
+        
+        self.test('systemd', 'systemd init system', check_systemd)
+        self.test('network', 'Network service', check_network)
+        self.test('ssh', 'SSH service', check_ssh)
+    
+    def test_performance(self):
+        """Test system performance"""
+        print("\n⚡ Performance Tests")
+        print("=" * 60)
+        
+        def check_cpu():
+            success, stdout, _ = self.run_command("nproc")
+            if success:
+                cores = int(stdout.strip())
+                return True, f"CPU cores: {cores}"
+            return False, "Cannot check CPU"
+        
+        def check_memory():
+            success, stdout, _ = self.run_command("free -m | grep Mem | awk '{print $2}'")
+            if success:
+                mem_mb = int(stdout.strip())
+                mem_gb = mem_mb / 1024
+                if mem_gb >= 2:
+                    return True, f"Memory: {mem_gb:.1f} GB"
+                return False, f"Low memory: {mem_gb:.1f} GB"
+            return False, "Cannot check memory"
+        
+        def check_load():
+            success, stdout, _ = self.run_command("uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ,")
+            if success:
+                load = float(stdout.strip())
+                if load < 2.0:
+                    return True, f"Load average: {load}"
+                return False, f"High load: {load}"
+            return False, "Cannot check load"
+        
+        self.test('cpu', 'CPU check', check_cpu)
+        self.test('memory', 'Memory check', check_memory)
+        self.test('load', 'System load check', check_load)
+    
+    def test_network(self):
+        """Test network connectivity"""
+        print("\n🌐 Network Tests")
+        print("=" * 60)
+        
+        def check_interface():
+            success, stdout, _ = self.run_command("ip link show | grep 'state UP' | wc -l")
+            if success:
+                count = int(stdout.strip())
+                if count > 0:
+                    return True, f"Active interfaces: {count}"
+                return False, "No active interfaces"
+            return False, "Cannot check interfaces"
+        
+        def check_dns():
+            success, _, _ = self.run_command("nslookup google.com")
+            return success, "DNS resolution working" if success else "DNS resolution failed"
+        
+        def check_connectivity():
+            success, _, _ = self.run_command("ping -c 1 -W 2 8.8.8.8")
+            return success, "Internet connectivity OK" if success else "No internet connectivity"
+        
+        self.test('interface', 'Network interface', check_interface)
+        self.test('dns', 'DNS resolution', check_dns)
+        self.test('connectivity', 'Internet connectivity', check_connectivity)
+    
+    def generate_report(self):
+        """Generate test report"""
+        report_file = self.report_dir / f"test-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        
+        report = {
+            'timestamp': datetime.now().isoformat(),
+            'summary': {
+                'total': len(self.test_results),
+                'passed': self.passed,
+                'failed': self.failed,
+                'warnings': self.warnings,
+                'success_rate': f"{(self.passed / len(self.test_results) * 100):.1f}%" if self.test_results else "0%"
+            },
+            'results': self.test_results
+        }
+        
+        with open(report_file, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        return report_file
+    
+    def show_summary(self):
+        """Show test summary"""
+        print("\n" + "=" * 60)
+        print("  Test Summary")
+        print("=" * 60)
+        
+        total = len(self.test_results)
+        success_rate = (self.passed / total * 100) if total > 0 else 0
+        
+        print(f"\nTotal Tests:  {total}")
+        print(f"Passed:       {self.passed} ✓")
+        print(f"Failed:       {self.failed} ✗")
+        print(f"Success Rate: {success_rate:.1f}%")
+        
+        if self.failed > 0:
+            print("\n⚠️  Failed Tests:")
+            for result in self.test_results:
+                if result['status'] in ['FAIL', 'ERROR']:
+                    print(f"  - {result['description']}: {result['message']}")
+        
+        print("=" * 60)
+    
+    def run_all_tests(self):
+        """Run all test suites"""
+        print("\n" + "=" * 60)
+        print("  SentinelX OS - Automated Testing Suite")
+        print("=" * 60)
+        
+        self.test_kernel()
+        self.test_packages()
+        self.test_security()
+        self.test_filesystem()
+        self.test_services()
+        self.test_performance()
+        self.test_network()
+        
+        self.show_summary()
+        
+        report_file = self.generate_report()
+        print(f"\nDetailed report saved to: {report_file}")
+        
+        # Return exit code based on test results
+        return 0 if self.failed == 0 else 1
+
+def main():
+    tester = SentinelXTester()
+    exit_code = tester.run_all_tests()
+    sys.exit(exit_code)
+
+if __name__ == '__main__':
+    main()
