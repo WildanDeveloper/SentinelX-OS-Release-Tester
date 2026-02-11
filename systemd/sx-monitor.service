@@ -1,0 +1,26 @@
+[Unit]
+Description=SentinelX System Monitoring Service
+Documentation=https://docs.sentinelx.org/monitoring
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sx-monitor-daemon
+Restart=always
+RestartSec=10
+User=sentinelx
+StandardOutput=journal
+StandardError=journal
+
+# Performance
+Nice=10
+
+# Security
+PrivateTmp=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/sentinelx /var/lib/sentinelx
+
+[Install]
+WantedBy=multi-user.target

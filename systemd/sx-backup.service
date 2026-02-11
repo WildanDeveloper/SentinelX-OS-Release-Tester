@@ -1,0 +1,21 @@
+[Unit]
+Description=SentinelX Automatic Backup Service
+Documentation=https://docs.sentinelx.org/backup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sx-backup auto
+User=root
+StandardOutput=journal
+StandardError=journal
+
+# Security
+PrivateTmp=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sentinelx/snapshots /var/log/sentinelx
+
+[Install]
+WantedBy=multi-user.target
