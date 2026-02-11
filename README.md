@@ -1,1 +1,0 @@
-# SentinelX-OS-Release-Tester
